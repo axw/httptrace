@@ -90,6 +90,7 @@ queryNodes:
 		}
 
 		root := gotree.New("")
+		orphaned := gotree.New(color.RedString("<orphaned>"))
 		treeNodes := make(map[nodeId]gotree.Tree)
 		treeNodes[nodeId{traceID: traceID}] = root
 		for id, node := range nodes {
@@ -102,10 +103,16 @@ queryNodes:
 		for id, node := range nodes {
 			parentNode := treeNodes[nodeId{traceID: id.traceID, spanID: node.parentID}]
 			if parentNode == nil {
-				// Missing a node, so go back and query again.
-				continue queryNodes
+				if recentRequest {
+					// Missing a node, so go back and query again.
+					continue queryNodes
+				}
+				parentNode = orphaned
 			}
 			parentNode.AddTree(treeNodes[id])
+		}
+		if len(orphaned.Items()) > 0 {
+			root.AddTree(orphaned)
 		}
 		for _, tree := range root.Items() {
 			fmt.Println(tree.Print())
