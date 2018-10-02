@@ -175,36 +175,33 @@ func fetchTrace(ctx context.Context) (map[nodeId]nodeDetails, error) {
 			Index("apm-*-transaction-*").
 			SearchSource(elastic.NewSearchSource().
 				Size(10000).
-				Query(elastic.NewTermQuery("transaction.trace_id", traceID))),
+				Query(elastic.NewTermQuery("trace.id", traceID))),
 
 		elastic.NewSearchRequest().
 			Index("apm-*-span-*").
 			SearchSource(elastic.NewSearchSource().
 				Size(10000).
-				Query(elastic.NewTermQuery("span.trace_id", traceID))),
+				Query(elastic.NewTermQuery("trace.id", traceID))),
 	).Do(ctx)
 	if err != nil {
 		return nil, errors.Wrap(err, "querying elasticsearch")
 	}
 
-	type CommonFields struct {
-		TraceID  string `json:"trace_id"`
-		ParentID string `json:"parent_id"`
-		Name     string `json:"name"`
-	}
 	type source struct {
 		Context struct {
 			Service struct {
 				Name string
 			}
 		}
-		Span *struct {
-			CommonFields
+		Trace  struct{ ID string } `json:"trace"`
+		Parent struct{ ID string } `json:"parent"`
+		Span   *struct {
 			HexID string `json:"hex_id"`
+			Name  string `json:"name"`
 		}
 		Transaction *struct {
-			CommonFields
-			ID string
+			ID   string
+			Name string `json:"name"`
 		}
 	}
 
@@ -228,19 +225,17 @@ func fetchTrace(ctx context.Context) (map[nodeId]nodeDetails, error) {
 			var nodeDetails nodeDetails
 			switch {
 			case source.Span != nil:
-				nodeId.traceID = source.Span.TraceID
 				nodeId.spanID = source.Span.HexID
 				nodeDetails.name = source.Span.Name
-				nodeDetails.parentID = source.Span.ParentID
 			case source.Transaction != nil:
-				nodeId.traceID = source.Transaction.TraceID
 				nodeId.spanID = source.Transaction.ID
 				nodeDetails.name = source.Transaction.Name
-				nodeDetails.parentID = source.Transaction.ParentID
 				nodeDetails.transaction = true
 			default:
 				panic("no transaction or span in doc")
 			}
+			nodeId.traceID = source.Trace.ID
+			nodeDetails.parentID = source.Parent.ID
 			nodeDetails.service = source.Context.Service.Name
 			nodes[nodeId] = nodeDetails
 		}
