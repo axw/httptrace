@@ -16,9 +16,8 @@ import (
 	"github.com/fatih/color"
 	"github.com/olivere/elastic"
 	"github.com/pkg/errors"
-
-	"github.com/elastic/apm-agent-go"
-	"github.com/elastic/apm-agent-go/module/apmhttp"
+	"go.elastic.co/apm"
+	"go.elastic.co/apm/module/apmhttp"
 )
 
 var (
@@ -95,6 +94,9 @@ queryNodes:
 		treeNodes[nodeId{traceID: traceID}] = root
 		for id, node := range nodes {
 			nodeText := fmt.Sprintf("%s (%s)", node.name, node.service)
+			if node.result != "" {
+				nodeText += fmt.Sprintf(" => %s", node.result)
+			}
 			if node.transaction {
 				nodeText = color.CyanString(nodeText)
 			}
@@ -125,8 +127,8 @@ queryNodes:
 
 func doRequest(url *url.URL) {
 	client := apmhttp.WrapClient(http.DefaultClient)
-	tx := elasticapm.DefaultTracer.StartTransaction("GET "+url.String(), "request")
-	ctx := elasticapm.ContextWithTransaction(context.Background(), tx)
+	tx := apm.DefaultTracer.StartTransaction("GET "+url.String(), "request")
+	ctx := apm.ContextWithTransaction(context.Background(), tx)
 	req, _ := http.NewRequest("GET", url.String(), nil)
 	req = req.WithContext(ctx)
 	resp, err := client.Do(req)
@@ -142,7 +144,7 @@ func doRequest(url *url.URL) {
 	flushed := make(chan struct{})
 	go func() {
 		defer close(flushed)
-		elasticapm.DefaultTracer.Flush(ctxFlush.Done())
+		apm.DefaultTracer.Flush(ctxFlush.Done())
 	}()
 	for {
 		select {
@@ -160,6 +162,7 @@ type nodeDetails struct {
 	parentID    string
 	name        string
 	service     string
+	result      string
 	transaction bool
 }
 
@@ -200,8 +203,9 @@ func fetchTrace(ctx context.Context) (map[nodeId]nodeDetails, error) {
 			Name  string `json:"name"`
 		}
 		Transaction *struct {
-			ID   string
-			Name string `json:"name"`
+			ID     string
+			Name   string `json:"name"`
+			Result string `json:"result"`
 		}
 	}
 
@@ -230,6 +234,7 @@ func fetchTrace(ctx context.Context) (map[nodeId]nodeDetails, error) {
 			case source.Transaction != nil:
 				nodeId.spanID = source.Transaction.ID
 				nodeDetails.name = source.Transaction.Name
+				nodeDetails.result = source.Transaction.Result
 				nodeDetails.transaction = true
 			default:
 				panic("no transaction or span in doc")
