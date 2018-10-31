@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
@@ -21,13 +23,16 @@ import (
 )
 
 var (
-	esURL        string
-	traceID      string
-	pollDuration time.Duration
+	esURL         string
+	kibanaURLFlag string
+	kibanaURL     *url.URL
+	traceID       string
+	pollDuration  time.Duration
 )
 
 func init() {
 	flag.StringVar(&esURL, "es", "http://localhost:9200", "Whitespace-delimited list of Elasticsearch server URLs")
+	flag.StringVar(&kibanaURLFlag, "kibana", "http://localhost:5601", "Base URL for Kibana")
 	flag.StringVar(&traceID, "trace", "", "Trace ID to query (must not also specify URL to fetch)")
 	flag.DurationVar(&pollDuration, "d", 30*time.Second, "Amount of time to wait for events")
 
@@ -50,6 +55,12 @@ func main() {
 		os.Exit(2)
 	}
 
+	var err error
+	kibanaURL, err = url.Parse(kibanaURLFlag)
+	if err != nil {
+		log.Fatalf("failed to parse Kibana URL %q: %v", kibanaURLFlag, err)
+	}
+
 	var deadline time.Time
 	var recentRequest bool
 	if len(args) == 1 {
@@ -62,7 +73,7 @@ func main() {
 		}
 		doRequest(url)
 		recentRequest = true
-		fmt.Println("polling for new events for", pollDuration)
+		fmt.Printf("polling for new events for %s...\n\n", pollDuration)
 		deadline = time.Now().Add(pollDuration)
 	}
 
@@ -88,6 +99,7 @@ queryNodes:
 			}
 		}
 
+		var rootTransactions []nodeId
 		root := gotree.New("")
 		orphaned := gotree.New(color.RedString("<orphaned>"))
 		treeNodes := make(map[nodeId]gotree.Tree)
@@ -112,12 +124,18 @@ queryNodes:
 				parentNode = orphaned
 			}
 			parentNode.AddTree(treeNodes[id])
+			if node.transaction && parentNode == root {
+				rootTransactions = append(rootTransactions, id)
+			}
+		}
+		for _, id := range rootTransactions {
+			fmt.Println(treeNodes[id].Print())
+			if transactionURL, err := transactionURL(id, nodes[id]); err == nil {
+				fmt.Printf("✨ Open in Kibana: %s ✨\n\n", color.YellowString(transactionURL))
+			}
 		}
 		if len(orphaned.Items()) > 0 {
-			root.AddTree(orphaned)
-		}
-		for _, tree := range root.Items() {
-			fmt.Println(tree.Print())
+			fmt.Println(orphaned.Print())
 		}
 		if !recentRequest {
 			break
@@ -135,7 +153,8 @@ func doRequest(url *url.URL) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
+	io.Copy(ioutil.Discard, resp.Body)
 	traceContext := tx.TraceContext()
 	tx.End()
 
@@ -158,9 +177,49 @@ func doRequest(url *url.URL) {
 	}
 }
 
+func transactionURL(id nodeId, details nodeDetails) (string, error) {
+	kuery := fmt.Sprintf("trace.id:%s and transaction.id:%s", id.traceID, id.spanID)
+	u := fmt.Sprintf("/app/apm#/%s/transactions/%s/%s?_g=()&kuery=%s",
+		details.service,
+		details.type_,
+		url.PathEscape(details.name),
+		url.PathEscape(kuery),
+	)
+	// TODO(axw) check how we should escape ~ in the name.
+	// See: https://github.com/elastic/kibana/issues/24892
+	u = strings.Replace(u, "%", "~", -1)
+
+	content := strings.NewReader(fmt.Sprintf(`{"url":%q}`, u))
+	kibanaURL := kibanaURL.String()
+	req, err := http.NewRequest("POST", kibanaURL+"/api/shorten_url", content)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("kbn-xsrf", "true")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		io.Copy(os.Stderr, resp.Body)
+		return "", errors.New("error shortening URL")
+	}
+
+	var result struct {
+		URLID string `json:"urlId"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+	return kibanaURL + "/goto/" + result.URLID, nil
+}
+
 type nodeDetails struct {
 	parentID    string
 	name        string
+	type_       string
 	service     string
 	result      string
 	transaction bool
@@ -201,10 +260,12 @@ func fetchTrace(ctx context.Context) (map[nodeId]nodeDetails, error) {
 		Span   *struct {
 			HexID string `json:"hex_id"`
 			Name  string `json:"name"`
+			Type  string `json:"type"`
 		}
 		Transaction *struct {
 			ID     string
 			Name   string `json:"name"`
+			Type   string `json:"type"`
 			Result string `json:"result"`
 		}
 	}
@@ -231,9 +292,11 @@ func fetchTrace(ctx context.Context) (map[nodeId]nodeDetails, error) {
 			case source.Span != nil:
 				nodeId.spanID = source.Span.HexID
 				nodeDetails.name = source.Span.Name
+				nodeDetails.type_ = source.Span.Type
 			case source.Transaction != nil:
 				nodeId.spanID = source.Transaction.ID
 				nodeDetails.name = source.Transaction.Name
+				nodeDetails.type_ = source.Transaction.Type
 				nodeDetails.result = source.Transaction.Result
 				nodeDetails.transaction = true
 			default:
